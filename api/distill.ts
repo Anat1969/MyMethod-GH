@@ -33,9 +33,14 @@ function parsed(text: string) {
   }
   return out;
 }
-async function gemini(key: string, input: string) {
+async function gemini(
+  key: string,
+  input: string,
+  model = "gemini-flash-latest",
+  timeout = 12000,
+) {
   const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-goog-api-key": key },
@@ -44,14 +49,17 @@ async function gemini(key: string, input: string) {
         contents: [{ role: "user", parts: [{ text: input }] }],
         generationConfig: {
           responseMimeType: "application/json",
-          maxOutputTokens: 1000,
+          maxOutputTokens: 4096,
           temperature: 0.3,
         },
       }),
-      signal: AbortSignal.timeout(25000),
+      signal: AbortSignal.timeout(timeout),
     },
   );
-  if (!r.ok) throw Error("gemini failed");
+  if (!r.ok) {
+    console.warn("Gemini request failed", model, r.status);
+    throw Error("gemini failed");
+  }
   const d = await r.json();
   return {
     ...parsed(
@@ -61,6 +69,34 @@ async function gemini(key: string, input: string) {
     ),
     provider: "Gemini",
   };
+}
+let liteModel: { name: string; until: number } | undefined;
+async function availableLite(key: string) {
+  if (liteModel && liteModel.until > Date.now()) return liteModel.name;
+  const response = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000",
+    { headers: { "x-goog-api-key": key }, signal: AbortSignal.timeout(5000) },
+  );
+  if (!response.ok) throw Error("model discovery failed");
+  const data = await response.json();
+  const models = (data.models ?? []).filter(
+    (m: { name: string; supportedGenerationMethods?: string[] }) =>
+      m.supportedGenerationMethods?.includes("generateContent") &&
+      /gemini-.*flash.*lite/.test(m.name) &&
+      !/(image|tts|audio|batch)/.test(m.name),
+  );
+  models.sort((a: { name: string }, b: { name: string }) =>
+    b.name.localeCompare(a.name, undefined, { numeric: true }),
+  );
+  const name =
+    models.find((m: { name: string }) => !/(preview|exp)/.test(m.name))?.name ??
+    models[0]?.name;
+  if (!name) throw Error("no lite model available");
+  liteModel = {
+    name: name.replace(/^models\//, ""),
+    until: Date.now() + 3600000,
+  };
+  return liteModel.name;
 }
 async function claude(key: string, input: string) {
   const model = process.env.CLAUDE_FALLBACK_MODEL;
@@ -91,6 +127,44 @@ async function claude(key: string, input: string) {
     ),
     provider: "Claude · גיבוי",
   };
+}
+function streamed(job: () => Promise<Record<string, string>>) {
+  const encoder = new TextEncoder();
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let canceled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(" \n"));
+      timer = setInterval(() => {
+        if (!canceled) controller.enqueue(encoder.encode(" \n"));
+      }, 4000);
+      void job()
+        .then((out) => {
+          if (!canceled)
+            controller.enqueue(encoder.encode(JSON.stringify(out)));
+        })
+        .catch(() => {
+          if (!canceled)
+            controller.enqueue(
+              encoder.encode(
+                JSON.stringify({
+                  error:
+                    "שירות ה-AI לא השלים תשובה תקינה. התיעוד נשמר; אפשר לנסות שוב בעוד רגע.",
+                }),
+              ),
+            );
+        })
+        .finally(() => {
+          clearInterval(timer);
+          if (!canceled) controller.close();
+        });
+    },
+    cancel() {
+      canceled = true;
+      clearInterval(timer);
+    },
+  });
+  return new Response(stream, { headers });
 }
 export default async function handler(req: Request) {
   const geminiKey = process.env.GEMINI_API_KEY,
@@ -148,13 +222,32 @@ export default async function handler(req: Request) {
     if (!clean.idea.trim())
       return response({ error: "יש לכתוב רעיון לפני הזיקוק." }, 400);
     const input = JSON.stringify(clean);
-    try {
-      return response(await gemini(geminiKey, input));
-    } catch {
-      if (claudeKey && process.env.CLAUDE_FALLBACK_MODEL)
-        return response(await claude(claudeKey, input));
-      throw Error("provider unavailable");
-    }
+    // Send JSON whitespace immediately, then keep the stream alive while the provider works.
+    // JSON parsers accept leading whitespace. This avoids the Edge 25s initial-response deadline.
+    return streamed(async () => {
+      try {
+        return await gemini(geminiKey, input);
+      } catch (error) {
+        console.warn(
+          "Gemini primary did not complete",
+          error instanceof Error
+            ? error.name + ": " + error.message
+            : "unknown",
+        );
+        try {
+          return await gemini(
+            geminiKey,
+            input,
+            await availableLite(geminiKey),
+            16000,
+          );
+        } catch {
+          if (claudeKey && process.env.CLAUDE_FALLBACK_MODEL)
+            return await claude(claudeKey, input);
+          throw Error("provider unavailable");
+        }
+      }
+    });
   } catch {
     return response(
       {

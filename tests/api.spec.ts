@@ -112,12 +112,117 @@ test("invalid model output fails without inventing a response", async () => {
     );
   try {
     const r = await handler(req(payload, "bad-model"));
-    expect(r.status).toBe(502);
+    expect(r.status).toBe(200);
     expect(await r.json()).toHaveProperty("error");
   } finally {
     globalThis.fetch = fetchOld;
     if (old) process.env.GEMINI_API_KEY = old;
     else delete process.env.GEMINI_API_KEY;
     if (oldClaude) process.env.ANTHROPIC_API_KEY = oldClaude;
+  }
+});
+test("slow provider receives an immediate stream before model output", async () => {
+  const old = process.env.GEMINI_API_KEY,
+    fetchOld = globalThis.fetch;
+  process.env.GEMINI_API_KEY = "test-only";
+  let release: (r: Response) => void = () => {};
+  globalThis.fetch = () =>
+    new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+  try {
+    const result = await handler(req(payload, "slow-stream"));
+    const reader = result.body!.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value).trim()).toBe("");
+    release(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      insight: "רעיון מקבל צורה.",
+                      detail: "בודקים מסלול אחד.",
+                      question: "איזה רחוב בוחרים?",
+                      next: "בחרו רחוב.",
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      ),
+    );
+    let rest = "";
+    for (;;) {
+      const part = await reader.read();
+      if (part.done) break;
+      rest += new TextDecoder().decode(part.value);
+    }
+    expect(JSON.parse(rest)).toMatchObject({ provider: "Gemini" });
+  } finally {
+    globalThis.fetch = fetchOld;
+    if (old) process.env.GEMINI_API_KEY = old;
+    else delete process.env.GEMINI_API_KEY;
+  }
+});
+test("fallback is selected from Google model discovery and excludes media models", async () => {
+  const old = process.env.GEMINI_API_KEY,
+    fetchOld = globalThis.fetch;
+  process.env.GEMINI_API_KEY = "test-only";
+  const calls: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    calls.push(url);
+    if (url.includes("gemini-flash-latest:"))
+      throw new Error("primary temporarily unavailable");
+    if (url.includes("/models?"))
+      return new Response(
+        JSON.stringify({
+          models: [
+            {
+              name: "models/gemini-3.5-flash-lite",
+              supportedGenerationMethods: ["generateContent"],
+            },
+            {
+              name: "models/gemini-4-flash-lite-image",
+              supportedGenerationMethods: ["generateContent"],
+            },
+          ],
+        }),
+      );
+    return new Response(
+      JSON.stringify({
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  text: JSON.stringify({
+                    insight: "רעיון מקבל צורה.",
+                    detail: "בודקים רחוב אחד.",
+                    question: "למי מיועד הכלי?",
+                    next: "בחרו רחוב.",
+                  }),
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+  };
+  try {
+    const result = await handler(req(payload, "discovery-test"));
+    expect(await result.json()).toMatchObject({ provider: "Gemini" });
+    expect(calls[2]).toContain("gemini-3.5-flash-lite:generateContent");
+  } finally {
+    globalThis.fetch = fetchOld;
+    if (old) process.env.GEMINI_API_KEY = old;
+    else delete process.env.GEMINI_API_KEY;
   }
 });
