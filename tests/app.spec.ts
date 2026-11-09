@@ -159,3 +159,42 @@ test("all views mobile and desktop, motion, screenshots and installability", asy
   const result = await cdp.send("Page.getInstallabilityErrors");
   expect(result.installabilityErrors).toEqual([]);
 });
+test("import preserves old notebook until confirmation and supports Escape", async ({
+  page,
+}) => {
+  await page.goto("/#/lab");
+  await page.getByLabel("שם הרעיון", { exact: true }).fill("המחברת הקיימת");
+  const incoming = {
+    version: 1,
+    title: "מחברת מיובאת",
+    idea: "רעיון אחר",
+    audience: "תלמידים",
+    notes: "",
+    entries: {},
+    updatedAt: new Date().toISOString(),
+  };
+  const upload = () =>
+    page
+      .locator("input[type=file]")
+      .setInputFiles({
+        name: "valid.json",
+        mimeType: "application/json",
+        buffer: Buffer.from(JSON.stringify(incoming)),
+      });
+  await upload();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByLabel("שם הרעיון", { exact: true })).toHaveValue(
+    "המחברת הקיימת",
+  );
+  await upload();
+  await page.getByRole("button", { name: "אישור החלפה" }).click();
+  await expect(page.getByLabel("שם הרעיון", { exact: true })).toHaveValue(
+    "מחברת מיובאת",
+  );
+  await expect(page.locator(".save-status")).toContainText("נשמר");
+  await page.reload();
+  await expect(page.getByLabel("שם הרעיון", { exact: true })).toHaveValue(
+    "מחברת מיובאת",
+  );
+});
