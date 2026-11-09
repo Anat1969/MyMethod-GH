@@ -170,3 +170,59 @@ test("slow provider receives an immediate stream before model output", async () 
     else delete process.env.GEMINI_API_KEY;
   }
 });
+test("fallback is selected from Google model discovery and excludes media models", async () => {
+  const old = process.env.GEMINI_API_KEY,
+    fetchOld = globalThis.fetch;
+  process.env.GEMINI_API_KEY = "test-only";
+  const calls: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    calls.push(url);
+    if (url.includes("gemini-flash-latest:"))
+      throw new Error("primary temporarily unavailable");
+    if (url.includes("/models?"))
+      return new Response(
+        JSON.stringify({
+          models: [
+            {
+              name: "models/gemini-3.5-flash-lite",
+              supportedGenerationMethods: ["generateContent"],
+            },
+            {
+              name: "models/gemini-4-flash-lite-image",
+              supportedGenerationMethods: ["generateContent"],
+            },
+          ],
+        }),
+      );
+    return new Response(
+      JSON.stringify({
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  text: JSON.stringify({
+                    insight: "רעיון מקבל צורה.",
+                    detail: "בודקים רחוב אחד.",
+                    question: "למי מיועד הכלי?",
+                    next: "בחרו רחוב.",
+                  }),
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+  };
+  try {
+    const result = await handler(req(payload, "discovery-test"));
+    expect(await result.json()).toMatchObject({ provider: "Gemini" });
+    expect(calls[2]).toContain("gemini-3.5-flash-lite:generateContent");
+  } finally {
+    globalThis.fetch = fetchOld;
+    if (old) process.env.GEMINI_API_KEY = old;
+    else delete process.env.GEMINI_API_KEY;
+  }
+});
