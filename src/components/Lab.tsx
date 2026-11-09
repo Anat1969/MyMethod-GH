@@ -68,10 +68,12 @@ export function Lab({
           decision: entry.decision,
           reason: entry.reason,
         }),
-        signal: AbortSignal.timeout(40000),
+        signal: AbortSignal.timeout(55000),
       });
-      const d = await r.json();
-      if (!r.ok) throw Error(d.error || "הזיקוק לא הושלם. נסו שוב.");
+      const d = await r.json().catch(() => {
+        throw Error("השרת לא השלים את התשובה. התיעוד נשמר; נסו שוב.");
+      });
+      if (!r.ok || d.error) throw Error(d.error || "הזיקוק לא הושלם. נסו שוב.");
       if (
         !["insight", "detail", "question", "next"].every(
           (k) => typeof d[k] === "string",

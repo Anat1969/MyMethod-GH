@@ -112,12 +112,61 @@ test("invalid model output fails without inventing a response", async () => {
     );
   try {
     const r = await handler(req(payload, "bad-model"));
-    expect(r.status).toBe(502);
+    expect(r.status).toBe(200);
     expect(await r.json()).toHaveProperty("error");
   } finally {
     globalThis.fetch = fetchOld;
     if (old) process.env.GEMINI_API_KEY = old;
     else delete process.env.GEMINI_API_KEY;
     if (oldClaude) process.env.ANTHROPIC_API_KEY = oldClaude;
+  }
+});
+test("slow provider receives an immediate stream before model output", async () => {
+  const old = process.env.GEMINI_API_KEY,
+    fetchOld = globalThis.fetch;
+  process.env.GEMINI_API_KEY = "test-only";
+  let release: (r: Response) => void = () => {};
+  globalThis.fetch = () =>
+    new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+  try {
+    const result = await handler(req(payload, "slow-stream"));
+    const reader = result.body!.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value).trim()).toBe("");
+    release(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      insight: "רעיון מקבל צורה.",
+                      detail: "בודקים מסלול אחד.",
+                      question: "איזה רחוב בוחרים?",
+                      next: "בחרו רחוב.",
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      ),
+    );
+    let rest = "";
+    for (;;) {
+      const part = await reader.read();
+      if (part.done) break;
+      rest += new TextDecoder().decode(part.value);
+    }
+    expect(JSON.parse(rest)).toMatchObject({ provider: "Gemini" });
+  } finally {
+    globalThis.fetch = fetchOld;
+    if (old) process.env.GEMINI_API_KEY = old;
+    else delete process.env.GEMINI_API_KEY;
   }
 });
